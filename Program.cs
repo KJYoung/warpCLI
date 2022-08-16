@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using Warp;
 using Warp.Tools;
+using Warp.Sociology;
+using Warp.Headers;
 
 using System.Collections.ObjectModel;
 using System.Diagnostics.Contracts; 
@@ -15,13 +17,334 @@ using System.IO;
 using System.Text;
 using System.Xml;
 using System.Xml.XPath;
-using System.Windows;
+using System.Globalization; // for CultureInfo.
 
 namespace Warp{
+    // From Controls.StatusBar.xaml.cs
+    enum ProcessingStatus
+    {
+        Processed = 1,
+        Outdated = 2,
+        Unprocessed = 3,
+        FilteredOut = 4,
+        LeaveOut = 5
+    }
+    // From Controls.SingleAxisScatter.xaml.cs
+    public struct SingleAxisPoint
+    {
+        public double Value;
+        public int ColorID;
+        public Movie Context;
+
+        public SingleAxisPoint(double value, int colorID, Movie context)
+        {
+            Value = value;
+            ColorID = colorID;
+            Context = context;
+        }
+    }
+    // From Controls.DualAxisScatter.xaml.cs
+    public struct DualAxisPoint
+    {
+        public double X, Y;
+        public int ColorID;
+        public Movie Context;
+        public string Label;
+
+        public DualAxisPoint(double x, double y, int colorID, Movie context, string label)
+        {
+            X = x;
+            Y = y;
+            ColorID = colorID;
+            Context = context;
+            Label = label;
+        }
+    }
+
     public class Program{
+        public static GlobalOptions GlobalOptions = new GlobalOptions();
+
+        private BenchmarkTimer BenchmarkRead = new BenchmarkTimer("File read");
+        private BenchmarkTimer BenchmarkCTF = new BenchmarkTimer("CTF");
+        private BenchmarkTimer BenchmarkMotion = new BenchmarkTimer("Motion");
+        private BenchmarkTimer BenchmarkPicking = new BenchmarkTimer("Picking");
+        private BenchmarkTimer BenchmarkOutput = new BenchmarkTimer("Output");
+
+        private BenchmarkTimer BenchmarkAllProcessing = new BenchmarkTimer("All processing");
+
+        #region Helper methods
+        public static Image LoadAndPrepareGainReference()
+        {
+            Image Gain = Image.FromFilePatient(50, 500,
+                                               Options.Import.GainPath,
+                                               new int2(Options.Import.HeaderlessWidth, Options.Import.HeaderlessHeight),
+                                               (int)Options.Import.HeaderlessOffset,
+                                               ImageFormatsHelper.StringToType(Options.Import.HeaderlessType));
+
+            float Mean = MathHelper.Mean(Gain.GetHost(Intent.Read)[0]);
+            Gain.TransformValues(v => v == 0 ? 1 : v / Mean);
+
+            if (Options.Import.GainFlipX)
+                Gain = Gain.AsFlippedX();
+            if (Options.Import.GainFlipY)
+                Gain = Gain.AsFlippedY();
+            if (Options.Import.GainTranspose)
+                Gain = Gain.AsTransposed();
+
+            return Gain;
+        }
+        public static DefectModel LoadAndPrepareDefectMap()
+        {
+            Image Defects = Image.FromFilePatient(50, 500,
+                                                  Options.Import.DefectsPath,
+                                                  new int2(Options.Import.HeaderlessWidth, Options.Import.HeaderlessHeight),
+                                                  (int)Options.Import.HeaderlessOffset,
+                                                  ImageFormatsHelper.StringToType(Options.Import.HeaderlessType));
+
+            if (Options.Import.GainFlipX)
+                Defects = Defects.AsFlippedX();
+            if (Options.Import.GainFlipY)
+                Defects = Defects.AsFlippedY();
+            if (Options.Import.GainTranspose)
+                Defects = Defects.AsTransposed();
+
+            DefectModel Model = new DefectModel(Defects, 4);
+            Defects.Dispose();
+
+            return Model;
+        }
+
+        public static void LoadAndPrepareHeaderAndMap(string path, Image imageGain, DefectModel defectMap, decimal scaleFactor, out MapHeader header, out Image stack, bool needStack = true, int maxThreads = 8)
+        {
+            HeaderEER.GroupNFrames = Options.Import.EERGroupFrames;
+
+            header = MapHeader.ReadFromFilePatient(50, 500,
+                                                   path,
+                                                   new int2(Options.Import.HeaderlessWidth, Options.Import.HeaderlessHeight),
+                                                   Options.Import.HeaderlessOffset,
+                                                   ImageFormatsHelper.StringToType(Options.Import.HeaderlessType));
+
+            string Extension = Helper.PathToExtension(path).ToLower();
+            bool IsTiff = header.GetType() == typeof(HeaderTiff);
+            bool IsEER = header.GetType() == typeof(HeaderEER);
+
+            if (imageGain != null)
+                if (!IsEER)
+                    if (header.Dimensions.X != imageGain.Dims.X || header.Dimensions.Y != imageGain.Dims.Y)
+                        throw new Exception("Gain reference dimensions do not match image.");
+
+            int EERSupersample = 1;
+            if (imageGain != null && IsEER)
+            {
+                if (header.Dimensions.X == imageGain.Dims.X)
+                    EERSupersample = 1;
+                else if (header.Dimensions.X * 2 == imageGain.Dims.X)
+                    EERSupersample = 2;
+                else if (header.Dimensions.X * 4 == imageGain.Dims.X)
+                    EERSupersample = 3;
+                else
+                    throw new Exception("Invalid supersampling factor requested for EER based on gain reference dimensions");
+            }
+
+            HeaderEER.SuperResolution = EERSupersample;
+
+            if (IsEER && imageGain != null)
+            {
+                header.Dimensions.X = imageGain.Dims.X;
+                header.Dimensions.Y = imageGain.Dims.Y;
+            }
+            MapHeader Header = header;
+
+            int NThreads = (IsTiff || IsEER) ? 6 : 2;
+
+            int CurrentDevice = GPU.GetDevice();
+
+            if (needStack)
+            {
+                byte[] TiffBytes = null;
+                if (IsTiff)
+                {
+                    MemoryStream Stream = new MemoryStream();
+                    using (Stream BigBufferStream = IOHelper.OpenWithBigBuffer(path))
+                        BigBufferStream.CopyTo(Stream);
+                    TiffBytes = Stream.GetBuffer();
+                }
+
+                if (scaleFactor == 1M)
+                {
+                    stack = new Image(header.Dimensions);
+                    float[][] OriginalStackData = stack.GetHost(Intent.Write);
+
+                    Helper.ForCPU(0, header.Dimensions.Z, NThreads, threadID => GPU.SetDevice(CurrentDevice), (z, threadID) =>
+                    {
+                        Image Layer = null;
+                        MemoryStream TiffStream = TiffBytes != null ? new MemoryStream(TiffBytes) : null;
+
+                        if (!IsEER)
+                            Layer = Image.FromFilePatient(50, 500,
+                                                        path,
+                                                        new int2(Options.Import.HeaderlessWidth, Options.Import.HeaderlessHeight),
+                                                        (int)Options.Import.HeaderlessOffset,
+                                                        ImageFormatsHelper.StringToType(Options.Import.HeaderlessType),
+                                                        z,
+                                                        TiffStream);
+                        else
+                        {
+                            Layer = new Image(Header.Dimensions.Slice());
+                            EERNative.ReadEERPatient(50, 500,
+                                                     path, z * 10, (z + 1) * 10, EERSupersample, Layer.GetHost(Intent.Write)[0]);
+                        }
+
+                        lock (OriginalStackData)
+                        {
+                            if (imageGain != null)
+                            {
+                                if (IsEER)
+                                    Layer.DivideSlices(imageGain);
+                                else
+                                    Layer.MultiplySlices(imageGain);
+                            }
+
+                            if (defectMap != null)
+                            {
+                                Image LayerCopy = Layer.GetCopyGPU();
+                                defectMap.Correct(LayerCopy, Layer);
+                                LayerCopy.Dispose();
+                            }
+
+                            Layer.Xray(20f);
+
+                            OriginalStackData[z] = Layer.GetHost(Intent.Read)[0];
+                            Layer.Dispose();
+                        }
+
+                    }, null);
+                }
+                else
+                {
+                    int3 ScaledDims = new int3((int)Math.Round(header.Dimensions.X * scaleFactor) / 2 * 2,
+                                               (int)Math.Round(header.Dimensions.Y * scaleFactor) / 2 * 2,
+                                               header.Dimensions.Z);
+
+                    stack = new Image(ScaledDims);
+                    float[][] OriginalStackData = stack.GetHost(Intent.Write);
+
+                    int PlanForw = GPU.CreateFFTPlan(header.Dimensions.Slice(), 1);
+                    int PlanBack = GPU.CreateIFFTPlan(ScaledDims.Slice(), 1);
+
+                    Helper.ForCPU(0, ScaledDims.Z, NThreads, threadID => GPU.SetDevice(CurrentDevice), (z, threadID) =>
+                    {
+                        Image Layer = null;
+                        MemoryStream TiffStream = TiffBytes != null ? new MemoryStream(TiffBytes) : null;
+
+                        if (!IsEER)
+                            Layer = Image.FromFilePatient(50, 500,
+                                                        path,
+                                                        new int2(Options.Import.HeaderlessWidth, Options.Import.HeaderlessHeight),
+                                                        (int)Options.Import.HeaderlessOffset,
+                                                        ImageFormatsHelper.StringToType(Options.Import.HeaderlessType),
+                                                        z,
+                                                        TiffStream);
+                        else
+                        {
+                            Layer = new Image(Header.Dimensions.Slice());
+                            EERNative.ReadEERPatient(50, 500,
+                                path, z * 10, (z + 1) * 10, EERSupersample, Layer.GetHost(Intent.Write)[0]);
+                        }
+
+                        Image ScaledLayer = null;
+                        lock (OriginalStackData)
+                        {
+                            if (imageGain != null)
+                            {
+                                if (IsEER)
+                                    Layer.DivideSlices(imageGain);
+                                else
+                                    Layer.MultiplySlices(imageGain);
+                            }
+
+                            if (defectMap != null)
+                            {
+                                Image LayerCopy = Layer.GetCopyGPU();
+                                defectMap.Correct(LayerCopy, Layer);
+                                LayerCopy.Dispose();
+                            }
+
+                            Layer.Xray(20f);
+
+                            ScaledLayer = Layer.AsScaled(new int2(ScaledDims), PlanForw, PlanBack);
+                            Layer.Dispose();
+                        }
+
+                        OriginalStackData[z] = ScaledLayer.GetHost(Intent.Read)[0];
+                        ScaledLayer.Dispose();
+
+                    }, null);
+
+                    GPU.DestroyFFTPlan(PlanForw);
+                    GPU.DestroyFFTPlan(PlanBack);
+                }
+            }
+            else
+            {
+                stack = null;
+            }
+        }
+        public string LocatePickingModel(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            if (Directory.Exists(name))
+            {
+                return name;
+            }
+            else if (Directory.Exists(System.IO.Path.Combine(Environment.CurrentDirectory, "boxnet2models/" + name)))
+            {
+                return System.IO.Path.Combine(Environment.CurrentDirectory, "boxnet2models/" + name);
+            }
+
+            return null;
+        }
+        static ProcessingStatus GetMovieProcessingStatus(Movie movie, ProcessingOptionsMovieCTF optionsCTF, ProcessingOptionsMovieMovement optionsMovement, ProcessingOptionsBoxNet optionsBoxNet, ProcessingOptionsMovieExport optionsExport, Options options, bool considerFilter = true)
+        {
+            bool DoCTF = options.ProcessCTF;
+            bool DoMovement = options.ProcessMovement;
+            bool DoBoxNet = options.ProcessPicking;
+            bool DoExport = optionsExport.DoAverage || optionsExport.DoStack || optionsExport.DoDeconv;
+            
+            ProcessingStatus Status = ProcessingStatus.Processed;
+
+            if (movie.UnselectManual != null && (bool)movie.UnselectManual)
+            {
+                Status = ProcessingStatus.LeaveOut;
+            }
+            else if (movie.OptionsCTF == null && movie.OptionsMovement == null && movie.OptionsMovieExport == null)
+            {
+                Status = ProcessingStatus.Unprocessed;
+            }
+            else
+            {
+                if (DoCTF && (movie.OptionsCTF == null || movie.OptionsCTF != optionsCTF))
+                    Status = ProcessingStatus.Outdated;
+                else if (DoMovement && (movie.OptionsMovement == null || movie.OptionsMovement != optionsMovement))
+                    Status = ProcessingStatus.Outdated;
+                else if (DoBoxNet && (movie.OptionsBoxNet == null || movie.OptionsBoxNet != optionsBoxNet))
+                    Status = ProcessingStatus.Outdated;
+                else if (DoExport && (movie.OptionsMovieExport == null || movie.OptionsMovieExport != optionsExport))
+                    Status = ProcessingStatus.Outdated;
+            }
+
+            if (Status == ProcessingStatus.Processed && movie.UnselectFilter && movie.UnselectManual == null && considerFilter)
+                Status = ProcessingStatus.FilteredOut;
+
+            return Status;
+        }
+        #endregion
+
         public readonly FileDiscoverer FileDiscoverer;
         string starPath, starFilePath;
-        Options Options;
+        public static Options Options = new Options();
 
         public static bool IsPreprocessing = false;
         public static bool IsStoppingPreprocessing = false;
@@ -38,13 +361,13 @@ namespace Warp{
             TiltSeries[] Series = FileDiscoverer.GetImmutableFiles().Cast<TiltSeries>().ToArray();
             return Series;
         }
-        async Task tomoReconstruct(TiltSeries[] Series){
-            Console.WriteLine("Enter the name of the *star file [ Should not include the .star ]");
-            // starFilePath = Console.ReadLine() + ".star";
-            starFilePath = "/cdata/relion/Refine3D/job002/run_data_rln3.0" + ".star";
-            TomoParticleExport tpe = new TomoParticleExport(Series, starFilePath, Options);
-            await tpe.WorkStart();
-        }
+        // async Task tomoReconstruct(TiltSeries[] Series){
+        //     Console.WriteLine("Enter the name of the *star file [ Should not include the .star ]");
+        //     // starFilePath = Console.ReadLine() + ".star";
+        //     starFilePath = "/cdata/relion/Refine3D/job002/run_data_rln3.0" + ".star";
+        //     TomoParticleExport tpe = new TomoParticleExport(Series, starFilePath, Options);
+        //     await tpe.WorkStart();
+        // }
 
         private async void ButtonStartProcessing_OnClick()
         {
@@ -117,42 +440,31 @@ namespace Warp{
 
                     if (!IsTomo && Options.ProcessPicking)
                     {
-                        ProgressDialogController ProgressDialog = null;
 
                         Image.FreeDeviceAll();
 
                         try
                         {
-                            await Dispatcher.Invoke(async () => ProgressDialog = await this.ShowProgressAsync($"Loading {Options.Picking.ModelPath} model...", ""));
-                            ProgressDialog.SetIndeterminate();
+                            //await Dispatcher.Invoke(async () => ProgressDialog = await this.ShowProgressAsync($"Loading {Options.Picking.ModelPath} model...", ""));
 
                             if (string.IsNullOrEmpty(Options.Picking.ModelPath) || LocatePickingModel(Options.Picking.ModelPath) == null)
                                 throw new Exception("No BoxNet model selected. Please use the options panel to select a model.");
 
-                            MicrographDisplayControl.DropBoxNetworks();
+                            // MicrographDisplayControl.DropBoxNetworks();
                             foreach (var d in UsedDevices)
                                 BoxNetworks[d] = new BoxNet2(LocatePickingModel(Options.Picking.ModelPath), d, 2, 1, false);
                         }
                         catch (Exception exc)
                         {
-                            await Dispatcher.Invoke(async () =>
-                            {
-                                Console.WriteLine("Oopsie",
+                            Console.WriteLine("Oopsie",
                                                   "There was an error loading the specified BoxNet model for picking.\n\n" +
                                                   "The exception raised is:\n" + exc);
-
-                                ButtonStartProcessing_OnClick();
-                            });
 
                             ImageGain?.Dispose();
                             DefectMap?.Dispose();
 
-                            await ProgressDialog.CloseAsync();
-
                             return;
                         }
-
-                        await ProgressDialog.CloseAsync();
                     }
 
                     #endregion
@@ -177,9 +489,7 @@ namespace Warp{
 
                         if (File.Exists(PathBoxNetAll))
                         {
-                            ProgressDialogController ProgressDialog = null;
                             Console.WriteLine("Loading particle metadata from previous run...");
-                            ProgressDialog.SetIndeterminate();
 
                             TableBoxNetAll = new Star(PathBoxNetAll);
 
@@ -199,8 +509,6 @@ namespace Warp{
 
                                 AllMovieParticleRows[NameMapping[ColumnMicName[r]]].Add(TableBoxNetAll.GetRow(r));
                             }
-
-                            await ProgressDialog.CloseAsync();
                         }
                         else
                         {
@@ -262,7 +570,6 @@ namespace Warp{
                         var RepairMovies = TempMovies.Where(m => !AllMovieParticleRows.ContainsKey(m) && m.OptionsBoxNet != null && File.Exists(m.MatchingDir + m.RootName + "_" + BoxNetSuffix + ".star")).ToList();
                         if (RepairMovies.Count() > 0)
                         {
-                            ProgressDialogController ProgressDialog = null;
 
                             int NRepaired = 0;
                             foreach (var item in RepairMovies)
@@ -307,8 +614,6 @@ namespace Warp{
 
                                 NRepaired++;
                             }
-
-                            await ProgressDialog.CloseAsync();
                         }
 
                         #endregion
@@ -362,7 +667,7 @@ namespace Warp{
 
                         foreach (var item in ImmutableItems)
                         {
-                            ProcessingStatus Status = StatusBar.GetMovieProcessingStatus(item, OptionsCTF, OptionsMovement, OptionsBoxNet, OptionsExport, Options, false);
+                            ProcessingStatus Status = GetMovieProcessingStatus(item, OptionsCTF, OptionsMovement, OptionsBoxNet, OptionsExport, Options, false);
 
                             if (Status == ProcessingStatus.Outdated || Status == ProcessingStatus.Unprocessed)
                                 NeedProcessing.Add(item);
@@ -402,12 +707,7 @@ namespace Warp{
                                     foreach (var worker in Workers)
                                         worker?.Dispose();
 
-                                    await Dispatcher.InvokeAsync(async () =>
-                                    {
-                                        await this.ShowMessageAsync("Oopsie", "Image dimensions do not match those of the gain reference. Maybe it needs to be rotated or transposed?");
-
-                                        ButtonStartProcessing_OnClick();
-                                    });
+                                    Console.WriteLine("Oopsie", "Image dimensions do not match those of the gain reference. Maybe it needs to be rotated or transposed?");
 
                                     break;
                                 }
@@ -463,7 +763,7 @@ namespace Warp{
 
                                 if (!IsTomo)
                                 {
-                                    Debug.WriteLine(GPU.GetDevice() + " loading...");
+                                    Console.WriteLine(GPU.GetDevice() + " loading...");
                                     var TimerRead = BenchmarkRead.Start();
 
                                     LoadAndPrepareHeaderAndMap(item.Path, ImageGain, DefectMap, ScaleFactor, out OriginalHeader, out OriginalStack, false);
@@ -471,7 +771,7 @@ namespace Warp{
                                         Workers[gpuID].LoadStack(item.Path, ScaleFactor, CurrentOptionsExport.EERGroupFrames);
 
                                     BenchmarkRead.Finish(TimerRead);
-                                    Debug.WriteLine(GPU.GetDevice() + " loaded.");
+                                    Console.WriteLine(GPU.GetDevice() + " loaded.");
                                 }
 
                                 // Store original dimensions in Angstrom
@@ -492,7 +792,7 @@ namespace Warp{
                                     CurrentOptionsExport.Dimensions = StackDims;
                                 }
                                 
-                                Debug.WriteLine(GPU.GetDevice() + " processing...");
+                                Console.WriteLine(GPU.GetDevice() + " processing...");
 
                                 if (!IsPreprocessing)
                                 {
@@ -765,11 +1065,11 @@ namespace Warp{
                         }, 1, UsedDeviceProcesses);
 
 
-                        Dispatcher.Invoke(() =>
-                        {
-                            UpdateStatsAll();
-                        });
-
+                        // Dispatcher.Invoke(() =>
+                        // {
+                        //     UpdateStatsAll();
+                        // });
+                        UpdateStatsAll(); // Is it okay to just remove dispatcher? 2022/08/16 VKJY
                         #endregion
                     }
 
@@ -786,10 +1086,8 @@ namespace Warp{
 
                     if (Options.ProcessPicking && Options.Picking.DoExport && !string.IsNullOrEmpty(Options.Picking.ModelPath))
                     {
-                        ProgressDialogController ProgressDialog = null;
-                        await Dispatcher.Invoke(async () => ProgressDialog = await this.ShowProgressAsync($"Waiting for the last particle files to be written out...", ""));
-                        ProgressDialog.SetIndeterminate();
-
+                        // await Dispatcher.Invoke(async () => ProgressDialog = await this.ShowProgressAsync($"Waiting for the last particle files to be written out...", ""));
+                        
                         List<List<string>> RowsAll = new List<List<string>>();
                         List<List<string>> RowsGood = new List<List<string>>();
 
@@ -846,7 +1144,6 @@ namespace Warp{
                             catch { }
                         }
 
-                        await ProgressDialog.CloseAsync();
                     }
 
                     #endregion
@@ -857,17 +1154,12 @@ namespace Warp{
                 // Stop!
                 IsStoppingPreprocessing = true;
 
-                ButtonStartProcessing.IsEnabled = false;
-                ButtonStartProcessing.Content = "STOPPING...";
-
                 IsPreprocessing = false;
                 if (PreprocessingTask != null)
                 {
                     await PreprocessingTask;
                     PreprocessingTask = null;
                 }
-
-                MicrographDisplayControl.SetProcessingMode(false);
                 
                 #region Timers
 
@@ -887,13 +1179,13 @@ namespace Warp{
         }
         public Program(){
             #region Make sure everything is OK with GPUs
-            options = new Options();
-            options.MainWindow = this;
+            Options = new Options();
+            Options.MainWindow = this;
             System.Int32 gpuDeviceCountV = 0; // Options.Runtime.DeviceCount를 대체.
             try
             {
-                options.Runtime.DeviceCount = GPU.GetDeviceCount();
-                if (options.Runtime.DeviceCount <= 0){
+                Options.Runtime.DeviceCount = GPU.GetDeviceCount();
+                if (Options.Runtime.DeviceCount <= 0){
                     Console.WriteLine("No GPU detected!");
                     throw new Exception();
                 }
@@ -935,7 +1227,6 @@ namespace Warp{
             await main.discoverReady();
             TiltSeries[] Series = main.getSeries();
 
-
             for(int i=0; i<1; i++){
                 Console.WriteLine("List Series size? : {0}", Series.Length);
                 foreach (TiltSeries t in Series){
@@ -943,7 +1234,8 @@ namespace Warp{
                 }
             }
             
-            await main.tomoReconstruct(Series);
+            // await main.tomoReconstruct(Series);
+            main.ButtonStartProcessing_OnClick(); // Cannot await void VKJY
             return;
         }
 
@@ -975,7 +1267,7 @@ namespace Warp{
             int NProcessed = 0, NOutdated = 0, NUnprocessed = 0, NFilteredOut = 0, NUnselected = 0;
             for (int i = 0; i < Items.Length; i++)
             {
-                ProcessingStatus Status = StatusBar.GetMovieProcessingStatus(Items[i], OptionsCTF, OptionsMovement, OptionsBoxNet, OptionsExport, Options);
+                ProcessingStatus Status = GetMovieProcessingStatus(Items[i], OptionsCTF, OptionsMovement, OptionsBoxNet, OptionsExport, Options);
                 int ID = 0;
                 switch (Status)
                 {
@@ -1033,7 +1325,7 @@ namespace Warp{
                 for (int i = 0; i < Items.Length; i++)
                     DefocusPlotValues[i] = new SingleAxisPoint(DefocusValues[i], ColorIDs[i], Items[i]);
 
-                Dispatcher.InvokeAsync(() => PlotStatsDefocus.Points = new ObservableCollection<SingleAxisPoint>(DefocusPlotValues));
+                // Dispatcher.InvokeAsync(() => PlotStatsDefocus.Points = new ObservableCollection<SingleAxisPoint>(DefocusPlotValues));
 
                 #endregion
 
@@ -1052,10 +1344,12 @@ namespace Warp{
                     for (int i = 0; i < Items.Length; i++)
                         PhasePlotValues[i] = new SingleAxisPoint(PhaseValues[i], ColorIDs[i], Items[i]);
 
-                    Dispatcher.InvokeAsync(() => PlotStatsPhase.Points = new ObservableCollection<SingleAxisPoint>(PhasePlotValues));
+                    // Dispatcher.InvokeAsync(() => PlotStatsPhase.Points = new ObservableCollection<SingleAxisPoint>(PhasePlotValues));
                 }
-                else
-                    Dispatcher.InvokeAsync(() => PlotStatsPhase.Points = null);
+                else{
+                    Console.WriteLine("Line 1093.");
+                    // Dispatcher.InvokeAsync(() => PlotStatsPhase.Points = null);
+                }
 
                 #endregion
 
@@ -1337,7 +1631,7 @@ namespace Warp{
                     CTF[] AllCTFs = Items.Where(m => m.OptionsCTF != null && !m.UnselectFilter).Select(m => m.CTF.GetCopy()).ToArray();
                     decimal PixelSize = Options.BinnedPixelSizeMean;
 
-                    Dispatcher.Invoke(() => StatsDefocusAverageCTFFrequencyLabel.Text = $"1/{PixelSize:F1} Å");
+                    //Dispatcher.Invoke(() => StatsDefocusAverageCTFFrequencyLabel.Text = $"1/{PixelSize:F1} Å");
 
                     float[] AverageCTFValues = new float[192];
                     foreach (var ctf in AllCTFs)
