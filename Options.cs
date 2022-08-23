@@ -352,7 +352,10 @@ namespace Warp
                     RecalcBinnedPixelSize();
                 }
             }
-            catch { }
+            catch (Exception exc)
+            {
+                Console.WriteLine("There was an error loading the specified BoxNet model for picking.\n\n" + "The exception raised is:\n" + exc);
+            }
         }
 
         #region 2D processing settings creation and adoption
