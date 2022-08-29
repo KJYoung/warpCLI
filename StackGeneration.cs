@@ -333,7 +333,7 @@ namespace Warp.Controls.TaskDialogs.Tomo
                             TiltAngles = SortedAngle.Select(e => e.TiltAngle).ToArray(),
                             Rotation = AxisAngle
                         });
-
+                        Console.WriteLine("-Aligned Detected.");
                         // Write out tilt series into IMOD folder + its individual subfolder
                         //if (CreateStacks)
                         //{
@@ -361,6 +361,12 @@ namespace Warp.Controls.TaskDialogs.Tomo
             await Task.Delay(1500);
         }
 
+        public void SetValue(bool DontInvertTiltsParam, decimal PixelSizeParam, decimal DoseParam){
+            DontInvertTilts = DontInvertTiltsParam;
+            PixelSize = PixelSizeParam;
+            Dose = DoseParam;
+            Console.WriteLine("-Parameters for Imod import was done.");
+        }
         public void ButtonMdocPath_Click(String mdocPath)
         {
             if (mdocPath[mdocPath.Length - 1] != '/')
@@ -385,7 +391,7 @@ namespace Warp.Controls.TaskDialogs.Tomo
             PathMovie = moviePath;
         }
 
-        private async void ButtonWrite_Click(object sender)
+        public async Task ButtonWrite_Click()
         {
             List<string> Duplicates = new List<string>();
 
@@ -415,7 +421,7 @@ namespace Warp.Controls.TaskDialogs.Tomo
                 //     Options.MainWindow.AdjustInput();
                 // }
             }
-
+            await Task.Delay(1000);
         }
 
         public async Task ButtonCreateStacks_Click()

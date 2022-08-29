@@ -20,6 +20,7 @@ using System.Xml.XPath;
 using System.Globalization; // for CultureInfo.
 
 using Warp.Controls.TaskDialogs.Tomo;
+using Warp.Controls;
 
 namespace Warp{
     // From Controls.StatusBar.xaml.cs
@@ -358,11 +359,15 @@ namespace Warp{
 
         // static string direcNameV = "/home/kimv/warpPort/" ; // or "/cdata/"
         static string direcNameV = "/cdata/"; // or "/cdata/"
-        public async Task discoverReady(){
+        public async Task fileDiscovererReadyMRC(){
             FileDiscoverer.ChangePath(starPath, "*.mrc"); // CUSTOM VKJY
-            //FileDiscoverer.ChangePath(starPath, "*.tomostar"); // CUSTOM VKJY
             await Task.Delay(500); // For wait to set FileDiscoverer!!!!
         }
+        public async Task fileDiscovererReadyTOMOSTAR(){
+            FileDiscoverer.ChangePath(starPath, "*.tomostar"); // CUSTOM VKJY
+            await Task.Delay(2000); // For wait to set FileDiscoverer!!!!
+        }
+
         TiltSeries[] getSeries(){
             TiltSeries[] Series = FileDiscoverer.GetImmutableFiles().Cast<TiltSeries>().ToArray();
             return Series;
@@ -374,6 +379,192 @@ namespace Warp{
         //     TomoParticleExport tpe = new TomoParticleExport(Series, starFilePath, Options);
         //     await tpe.WorkStart();
         // }
+        private async Task ButtonProcessOneItemCTF_OnClick(Movie inputMovie)
+        {
+            if (inputMovie == null){
+                Console.WriteLine("Input Movie is null.");
+                return;
+            }
+
+            Movie Item = inputMovie;
+
+            Console.WriteLine($"-Processing CTF for {Item.Name}...");
+
+            await Task.Run(async () =>
+            {
+                Image ImageGain = null;
+                DefectModel DefectMap = null;
+                Image OriginalStack = null;
+
+                HeaderEER.GroupNFrames = Options.Import.EERGroupFrames;
+
+                try
+                {
+                    #region Get gain ref if needed
+
+                    if (!string.IsNullOrEmpty(Options.Import.GainPath) && Options.Import.CorrectGain && File.Exists(Options.Import.GainPath))
+                        ImageGain = LoadAndPrepareGainReference();
+
+                    if (!string.IsNullOrEmpty(Options.Import.DefectsPath) && Options.Import.CorrectDefects && File.Exists(Options.Import.DefectsPath))
+                        DefectMap = LoadAndPrepareDefectMap();
+
+                    if (ImageGain != null && DefectMap != null)
+                        if (ImageGain.Dims.X != DefectMap.Dims.X || ImageGain.Dims.Y != DefectMap.Dims.Y)
+                            throw new Exception("Gain reference and defect map dimensions don't match");
+
+                    #endregion
+
+                    bool IsTomo = Item.GetType() == typeof(TiltSeries);
+
+                    #region Load movie
+
+                    MapHeader OriginalHeader = null;
+                    decimal ScaleFactor = 1M / (decimal)Math.Pow(2, (double)Options.Import.BinTimes);
+
+                    if (!IsTomo)
+                        LoadAndPrepareHeaderAndMap(Item.Path, ImageGain, DefectMap, ScaleFactor, out OriginalHeader, out OriginalStack);
+
+                    #endregion
+
+                    ProcessingOptionsMovieCTF CurrentOptionsCTF = Options.GetProcessingMovieCTF();
+
+                    // Store original dimensions in Angstrom
+                    if (!IsTomo)
+                    {
+                        CurrentOptionsCTF.Dimensions = OriginalHeader.Dimensions.MultXY((float)Options.PixelSizeMean);
+                    }
+                    else
+                    {
+                        ((TiltSeries)Item).LoadMovieSizes(CurrentOptionsCTF);
+
+                        float3 StackDims = new float3(((TiltSeries)Item).ImageDimensionsPhysical, ((TiltSeries)Item).NTilts);
+                        CurrentOptionsCTF.Dimensions = StackDims;
+                    }
+
+                    if (Item.GetType() == typeof(Movie))
+                        Item.ProcessCTF(OriginalStack, CurrentOptionsCTF);
+                    else
+                        ((TiltSeries)Item).ProcessCTFSimultaneous(CurrentOptionsCTF);
+
+                    
+                    // VKJY Dispatcher
+                    // UpdateButtonOptionsAdopt();
+                    // ProcessingStatusBar.UpdateElements();
+
+                    UpdateStatsAll();
+
+                    OriginalStack?.Dispose();
+                    ImageGain?.Dispose();
+                    DefectMap?.Dispose();
+
+                    await Task.Delay(1000);
+                }
+                catch (Exception exc)
+                {
+                    ImageGain?.Dispose();
+                    DefectMap?.Dispose();
+                    OriginalStack?.Dispose();
+
+                    Console.WriteLine("-There is an error in CTF estimation.");
+                }
+            });
+        }
+
+        private async Task ButtonProcessOneItemTiltHandedness_Click(Movie inputMovie)
+        {
+            if (inputMovie == null)
+                return;
+
+            TiltSeries Series = (TiltSeries)inputMovie;
+
+            Console.WriteLine("Loading tilt movies and estimating gradients...");
+
+            await Task.Run(async () =>
+            {
+                try
+                {
+                    Movie[] TiltMovies = Series.TiltMoviePaths.Select(s => new Movie(Path.Combine(Series.DirectoryName, s))).ToArray();
+
+                    if (TiltMovies.Any(m => m.GridCTFDefocus.Values.Length < 2))
+                        throw new Exception("One or more tilt movies don't have local defocus information.\n" +
+                                            "Please run CTF estimation on all individual tilt movies with a 2x2 spatial resolution grid.");
+
+                    Series.VolumeDimensionsPhysical = new float3((float)Options.Tomo.DimensionsX,
+                                                                 (float)Options.Tomo.DimensionsY,
+                                                                 (float)Options.Tomo.DimensionsZ) * (float)Options.PixelSizeMean;
+                    Series.ImageDimensionsPhysical = new float2(Series.VolumeDimensionsPhysical.X, Series.VolumeDimensionsPhysical.Y);
+
+                    float[] GradientsEstimated = new float[Series.NTilts];
+                    float[] GradientsAssumed = new float[Series.NTilts];
+
+                    float3[] Points = 
+                    {
+                        new float3(0, Series.VolumeDimensionsPhysical.Y / 2, Series.VolumeDimensionsPhysical.Z / 2),
+                        new float3(Series.VolumeDimensionsPhysical.X, Series.VolumeDimensionsPhysical.Y / 2, Series.VolumeDimensionsPhysical.Z / 2)
+                    };
+
+                    float3[] Projected0 = Series.GetPositionInAllTilts(Points[0]).Select(v => v / new float3(Series.ImageDimensionsPhysical.X, Series.ImageDimensionsPhysical.Y, 1)).ToArray();
+                    float3[] Projected1 = Series.GetPositionInAllTilts(Points[1]).Select(v => v / new float3(Series.ImageDimensionsPhysical.X, Series.ImageDimensionsPhysical.Y, 1)).ToArray();
+
+                    for (int t = 0; t < Series.NTilts; t++)
+                    {
+                        float Interp0 = TiltMovies[t].GridCTFDefocus.GetInterpolated(new float3(Projected0[t].X, Projected0[0].Y, 0.5f));
+                        float Interp1 = TiltMovies[t].GridCTFDefocus.GetInterpolated(new float3(Projected1[t].X, Projected1[0].Y, 0.5f));
+                        GradientsEstimated[t] = Interp1 - Interp0;
+
+                        GradientsAssumed[t] = Projected1[t].Z - Projected0[t].Z;
+                    }
+
+                    if (GradientsEstimated.Length > 1)
+                    {
+                        GradientsEstimated = MathHelper.Normalize(GradientsEstimated);
+                        GradientsAssumed = MathHelper.Normalize(GradientsAssumed);
+                    }
+                    else
+                    {
+                        GradientsEstimated[0] = Math.Sign(GradientsEstimated[0]);
+                        GradientsAssumed[0] = Math.Sign(GradientsAssumed[0]);
+                    }
+
+                    float Correlation = MathHelper.DotProduct(GradientsEstimated, GradientsAssumed) / GradientsEstimated.Length;
+
+                    if (Correlation > 0)
+                        Console.WriteLine($"It looks like the angles are in accord with the estimated defocus gradients. Correlation = {Correlation:F2}");
+                    else
+                    {
+                        bool DoFlip = false;
+
+                        Console.WriteLine("You're in the Upside Down!\n" + $"It looks like the defocus handedness should be flipped. Correlation = {Correlation:F2}\n" +
+                                        "Would you like to flip it for all tilt series currently loaded?\n" +
+                                        "You should probably repeat CTF estimation after flipping.");
+                        Console.WriteLine("Type 1 for DoFlip, others for NotFlip");
+                        int var = Convert.ToInt32(Console.ReadLine());
+                        if(var == 1){
+                            DoFlip = true;
+                        }
+                        if (DoFlip)
+                        {
+                            Console.WriteLine("-Do Flip : Saving tilt series metadata...");
+
+                            TiltSeries[] AllSeries = FileDiscoverer.GetImmutableFiles().Select(m => (TiltSeries)m).ToArray();
+
+                            for (int i = 0; i < AllSeries.Length; i++)
+                            {
+                                AllSeries[i].AreAnglesInverted = !AllSeries[i].AreAnglesInverted;
+                                AllSeries[i].SaveMeta();
+                            }
+                        }else{
+                            Console.WriteLine("-Not Flip...");
+                        }
+                    }
+                    await Task.Delay(1500);
+                }
+                catch (Exception exc)
+                {   
+                    Console.WriteLine(exc.ToString());
+                }
+            });
+        }
 
         private async Task Preprocessing()
         {
@@ -1239,11 +1430,38 @@ namespace Warp{
             await stackGenImod.Reevaluate();
             await stackGenImod.ButtonCreateStacks_Click();
         }
+        
         private async Task CTFEstimation(){
+            // Import
+            DialogTomoImportImod stackGenImod = new DialogTomoImportImod(Options);
+            stackGenImod.ButtonMdocPath_Click("/cdata/EMPIAR-10164_ORIGINAL/mdoc/");
+            stackGenImod.ButtonMoviePath_Click("/cdata/EMPIAR-10164_ORIGINAL/frames/");
+            stackGenImod.ButtonImodPath_Click("/cdata/EMPIAR-10164_ORIGINAL/frames/dynamo_alignments");
+            stackGenImod.SetValue(false, 1.3500m, 3.00m);
+            await stackGenImod.Reevaluate();
+            await stackGenImod.ButtonWrite_Click();
+            // CTF estimation
+            await fileDiscovererReadyTOMOSTAR();
+            Movie[] TempMovies = FileDiscoverer.GetImmutableFiles();
+            Console.WriteLine($"-{TempMovies.Length} Movie was found.");
+            if(TempMovies.Length >= 1){
+                Console.WriteLine($"-First item is {TempMovies[0].Path}");
+            }
+            await ButtonProcessOneItemCTF_OnClick(TempMovies[0]); // Modify if we want to deal with multiple CTF
+            // Check Handedness
 
         }
-        private async Task Reconstruction(){
 
+        private async Task Reconstruction(){
+            await fileDiscovererReadyTOMOSTAR();
+            TiltSeries[] TiltSeries = FileDiscoverer.GetImmutableFiles().Cast<TiltSeries>().ToArray();
+            Console.WriteLine($"-{TiltSeries.Length} Movie was found.");
+            Console.WriteLine("-Extension was changed to '*.tomostar'.");
+
+
+            DialogTomoReconstruction fulltomoReconst = new DialogTomoReconstruction(TiltSeries, Options);
+            await fulltomoReconst.ButtonReconstruct_OnClick(true, false);
+            Console.WriteLine("RECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTION");
         }
         public Program(){
             #region Make sure everything is OK with GPUs
@@ -1274,7 +1492,7 @@ namespace Warp{
             #region File discoverer
 
             FileDiscoverer = new FileDiscoverer();
-            discoverReady();
+            fileDiscovererReadyMRC();
             FileDiscoverer.FilesChanged += FileDiscoverer_FilesChanged;
             FileDiscoverer.IncubationStarted += FileDiscoverer_IncubationStarted;
             FileDiscoverer.IncubationEnded += FileDiscoverer_IncubationEnded;
@@ -1296,8 +1514,9 @@ namespace Warp{
             Console.WriteLine("----1 : Preprocessing");
             Console.WriteLine("----2 : Manually deselect");
             Console.WriteLine("----3 : IMOD stack generation");
-            Console.WriteLine("----4 : CTF estimation, check handness");
-            Console.WriteLine("----5 : Reconstruction");
+            Console.WriteLine("----4 : Dynamo_alignment results import, CTF estimation");
+            Console.WriteLine("----5 : Check Handedness");
+            Console.WriteLine("----6 : Reconstruction");
             Console.WriteLine("Write the number!");
             int whichTask = Convert.ToInt32(Console.ReadLine());
             switch(whichTask){
@@ -1319,11 +1538,22 @@ namespace Warp{
                     await main.IMODStackGeneration();
                     break;
                 case 4:
-                    Console.WriteLine("4 : CTF!");
+                    Console.WriteLine("4 : Import and CTF!");
+                    Program.Options.Import.Extension = "*.tomostar";
+                    Console.WriteLine("-Extension was changed to '*.tomostar'.");
                     await main.CTFEstimation();
                     break;
                 case 5:
-                    Console.WriteLine("5 : Reconstruction!");
+                    Console.WriteLine("5 : Check Handedness!");
+                    Program.Options.Import.Extension = "*.tomostar";
+                    await main.fileDiscovererReadyTOMOSTAR();
+                    Movie[] TempMovies = main.FileDiscoverer.GetImmutableFiles();
+                    Console.WriteLine($"-{TempMovies.Length} Movie was found.");
+                    await main.ButtonProcessOneItemTiltHandedness_Click(TempMovies[0]);
+                    break;
+                case 6:
+                    Console.WriteLine("6 : Reconstruction!");
+                    Program.Options.Import.Extension = "*.tomostar";
                     await main.Reconstruction();
                     break;
                 default:
