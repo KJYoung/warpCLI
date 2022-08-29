@@ -19,6 +19,8 @@ using System.Xml;
 using System.Xml.XPath;
 using System.Globalization; // for CultureInfo.
 
+using Warp.Controls.TaskDialogs.Tomo;
+
 namespace Warp{
     // From Controls.StatusBar.xaml.cs
     enum ProcessingStatus
@@ -1231,47 +1233,11 @@ namespace Warp{
         
         private async Task IMODStackGeneration()
         {
-            IsPreprocessing = true;
-
-            bool IsTomo = Options.Import.ExtensionTomoSTAR;
-
-            int NDevices = GPU.GetDeviceCount();
-            List<int> UsedDevices = GetDeviceList();
-            List<int> UsedDeviceProcesses = Helper.Combine(Helper.ArrayOfFunction(i => UsedDevices.Select(d => d + i * NDevices).ToArray(), GlobalOptions.ProcessesPerDevice)).ToList();
-            
-            Movie[] ImmutableItems = FileDiscoverer.GetImmutableFiles();
-
-            Console.WriteLine("ImmutableItems length: " + ImmutableItems.Length);
-            
-            List<Movie> NeedProcessing = new List<Movie>();
-
-            ProcessingOptionsMovieCTF OptionsCTF = Options.GetProcessingMovieCTF();
-            ProcessingOptionsMovieMovement OptionsMovement = Options.GetProcessingMovieMovement();
-            ProcessingOptionsMovieExport OptionsExport = Options.GetProcessingMovieExport();
-            ProcessingOptionsBoxNet OptionsBoxNet = Options.GetProcessingBoxNet();
-
-            bool DoCTF = Options.ProcessCTF;
-            bool DoMovement = Options.ProcessMovement;
-            bool DoPicking = Options.ProcessPicking;
-
-            foreach (var item in ImmutableItems)
-            {
-                ProcessingStatus Status = GetMovieProcessingStatus(item, OptionsCTF, OptionsMovement, OptionsBoxNet, OptionsExport, Options, false);
-
-                if (Status == ProcessingStatus.Outdated || Status == ProcessingStatus.Unprocessed){
-                    NeedProcessing.Add(item);
-                    //Console.WriteLine("Added to NeedProcessing : " + item);
-                }else if (Status == ProcessingStatus.LeaveOut){
-                    Console.WriteLine("  Manually deselected : " + item.Name);
-                }else{
-
-                }
-            }
-
-            UpdateStatsAll(); // Is it okay to just remove dispatcher? 2022/08/16 VKJY
-            
-            Console.WriteLine("End of the onclick listener");
-            await Task.Delay(500);
+            DialogTomoImportImod stackGenImod = new DialogTomoImportImod(Options);
+            stackGenImod.ButtonMdocPath_Click("/cdata/EMPIAR-10164_ORIGINAL/mdoc/");
+            stackGenImod.ButtonMoviePath_Click("/cdata/EMPIAR-10164_ORIGINAL/frames/");
+            await stackGenImod.Reevaluate();
+            await stackGenImod.ButtonCreateStacks_Click();
         }
         private async Task CTFEstimation(){
 
@@ -1340,13 +1306,16 @@ namespace Warp{
                     await main.Preprocessing();
                     break;
                 case 2:
+                    // After Preprocessing, with Thumbnail, we can have a list to eliminate(manually)
+                    // 2 : Deselect Bad images.
                     Console.WriteLine("2 : Manually deselect.");
                     await main.ManuallyDeselect();
                     break;
                 case 3:
-                    // After Preprocessing, with Thumbnail, we can have a list to eliminate(manually)
-                    // 2-1 : Deselect Bad images.
+                    // IMOD stack generation!
                     Console.WriteLine("3 : IMOD stack generation!");
+                    Program.Options.Import.Extension = "*.tomostar";
+                    Console.WriteLine("-Extension was changed to '*.tomostar'.");
                     await main.IMODStackGeneration();
                     break;
                 case 4:
