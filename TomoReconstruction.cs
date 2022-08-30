@@ -22,9 +22,9 @@ namespace Warp.Controls
     public partial class DialogTomoReconstruction
     {
         private int NParallel = 1;
-        //private int3[] GridSizes;
-        //private int[] GridProgress;
-        //private string[] GridNames;
+        // private int3[] GridSizes;
+        // private int[] GridProgress;
+        // private string[] GridNames;
         // private ReconstructionMiniature[] GridControls;
         // private TextBlock[] GridLabels;
 

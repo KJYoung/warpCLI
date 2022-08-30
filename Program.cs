@@ -1458,7 +1458,6 @@ namespace Warp{
             Console.WriteLine($"-{TiltSeries.Length} Movie was found.");
             Console.WriteLine("-Extension was changed to '*.tomostar'.");
 
-
             DialogTomoReconstruction fulltomoReconst = new DialogTomoReconstruction(TiltSeries, Options);
             await fulltomoReconst.ButtonReconstruct_OnClick(true, false);
             Console.WriteLine("RECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTION");
