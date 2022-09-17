@@ -1460,14 +1460,15 @@ namespace Warp{
 
             DialogTomoReconstruction fulltomoReconst = new DialogTomoReconstruction(TiltSeries, Options);
             await fulltomoReconst.ButtonReconstruct_OnClick(true, false);
-            Console.WriteLine("RECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTIONRECONSTRUCTION");
+            Console.WriteLine("RECONSTRUCTION Done.");
         }
         public Program(){
             #region Make sure everything is OK with GPUs
             System.Int32 gpuDeviceCountV = 0; // Options.Runtime.DeviceCount를 대체.
             try
             {
-                Options.Runtime.DeviceCount = GPU.GetDeviceCount();
+                // Options.Runtime.DeviceCount = GPU.GetDeviceCount();
+                Options.Runtime.DeviceCount = 1;
                 if (Options.Runtime.DeviceCount <= 0){
                     Console.WriteLine("No GPU detected!");
                     throw new Exception();
@@ -1505,7 +1506,7 @@ namespace Warp{
 
         async static Task Main(string[] args){
             Console.WriteLine("-------------- Program for Warp in Linux  --------------");
-            Options.Load(direcNameV + "test2.settings");
+            Options.Load(direcNameV + "test.settings");
             Console.WriteLine("Import Result. Import directory : " + Options.Import.Folder); 
 
             Program main = new Program();
@@ -2055,11 +2056,11 @@ namespace Warp{
             List<int> Devices = new List<int>();
             
             
-            //for (int i = 0; i < GPU.GetDeviceCount(); i++)
+            // for (int i = 0; i < GPU.GetDeviceCount(); i++)
             //    Devices.Add(i);
-	        
+	        Devices.Add(0);
             
-	        Devices.Add(5);
+	        // Devices.Add(5);
 	        // Devices.Add(6);
             return Devices;
         }

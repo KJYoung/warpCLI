@@ -22,11 +22,6 @@ namespace Warp.Controls
     public partial class DialogTomoReconstruction
     {
         private int NParallel = 1;
-        // private int3[] GridSizes;
-        // private int[] GridProgress;
-        // private string[] GridNames;
-        // private ReconstructionMiniature[] GridControls;
-        // private TextBlock[] GridLabels;
 
         private TiltSeries[] Series;
         private Options Options;
@@ -35,33 +30,8 @@ namespace Warp.Controls
 
         public DialogTomoReconstruction(TiltSeries[] series, Options options)
         {
-            // InitializeComponent();
             Series = series;
             Options = options;
-        }
-
-        public void SetGridSize(int n, int3 size)
-        {
-            if (n >= NParallel)
-                return;
-
-            //GridSizes[n] = size;
-        }
-
-        public void SetGridProgress(int n, int value)
-        {
-            if (n >= NParallel)
-                return;
-
-            //GridProgress[n] = value;
-        }
-
-        public void SetGridName(int n, string name)
-        {
-            if (n >= NParallel)
-                return;
-
-            //GridNames[n] = name;
         }
 
         public async Task ButtonReconstruct_OnClick(bool isFilter, bool isManual)
@@ -102,11 +72,9 @@ namespace Warp.Controls
                 return true;
             }).ToList();
 
+            Console.WriteLine($"Valid series count : {ValidSeries.Count}");
             if (ValidSeries.Count == 0)
-            {
-                Console.WriteLine("There is no Valid series.");
                 return;
-            }
 
             #endregion
 
@@ -118,13 +86,9 @@ namespace Warp.Controls
 
             int Completed = 0;
 
-            await Task.Run(() =>
-            {
-                Helper.ForEachGPU(ValidSeries, (item, gpuID) =>
+            
+            Helper.ForEachGPU(ValidSeries, (item, gpuID) =>
                 {
-                    if (IsCanceled)
-                        return true;    // This cancels the iterator
-
                     ProcessingOptionsTomoFullReconstruction SeriesOptions = Options.GetProcessingTomoFullReconstruction();
 
                     item.ReconstructFull(SeriesOptions, (size, value, name) =>
@@ -135,8 +99,6 @@ namespace Warp.Controls
                     ++Completed;
                     return false;   // No need to cancel GPU ForEach iterator
                 }, 1);
-            });
-            await Task.Delay(1500);
         }
     }
 }
